@@ -525,16 +525,33 @@ class BearerExtractorMiddleware(BaseHTTPMiddleware):
             if gk:
                 token = gk.strip() or None
         # Debug logging for troubleshooting auth flow issues.
-        if request.url.path.startswith("/mcp"):
+        path = request.url.path
+        if path.startswith("/mcp"):
             hdr_summary = {
-                "path": request.url.path,
+                "path": path,
                 "method": request.method,
                 "has_auth": bool(request.headers.get("authorization")),
                 "has_xkey": bool(request.headers.get("x-gemini-api-key")),
                 "header_names": sorted([h.lower() for h in request.headers.keys()]),
             }
             LOG.info("MCP_AUTH_DEBUG %s", hdr_summary)
-        # Allow non-MCP routes (health, images) to pass through without a key.
+
+        # MCP Authorization Spec compliance: if no bearer is present on /mcp*,
+        # respond 401 with WWW-Authenticate so the client triggers the OAuth
+        # discovery + token flow.
+        if path.startswith("/mcp") and not token:
+            base = os.getenv("PUBLIC_BASE_URL", "https://mcp-nano-banana.mobiweb.pt").rstrip("/")
+            www_auth = (
+                f'Bearer realm="mcp-nano-banana", '
+                f'resource_metadata="{base}/.well-known/oauth-protected-resource"'
+            )
+            return JSONResponse(
+                {"error": "unauthorized", "detail": "missing bearer token"},
+                status_code=401,
+                headers={"WWW-Authenticate": www_auth},
+            )
+
+        # Allow non-MCP routes (health, images, /.well-known, /authorize, /token, /register) to pass through.
         if token:
             _api_key_var.set(token)
         return await call_next(request)
