@@ -524,18 +524,7 @@ class BearerExtractorMiddleware(BaseHTTPMiddleware):
             gk = request.headers.get("x-gemini-api-key")
             if gk:
                 token = gk.strip() or None
-        # Debug logging for troubleshooting auth flow issues.
         path = request.url.path
-        if path.startswith("/mcp"):
-            hdr_summary = {
-                "path": path,
-                "method": request.method,
-                "has_auth": bool(request.headers.get("authorization")),
-                "has_xkey": bool(request.headers.get("x-gemini-api-key")),
-                "header_names": sorted([h.lower() for h in request.headers.keys()]),
-            }
-            LOG.info("MCP_AUTH_DEBUG %s", hdr_summary)
-
         # MCP Authorization Spec compliance: if no bearer is present on /mcp*,
         # respond 401 with WWW-Authenticate so the client triggers the OAuth
         # discovery + token flow.
