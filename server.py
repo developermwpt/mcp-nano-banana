@@ -13,11 +13,16 @@ from __future__ import annotations
 
 import base64
 import contextvars
+import hashlib
+import html as _html
 import json
 import logging
 import os
+import secrets as _secrets
 import time
+import urllib.parse
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -229,7 +234,7 @@ async def generate_image(
     for cand in resp.get("candidates", []):
         for part in cand.get("content", {}).get("parts", []):
             inline = part.get("inlineData") or part.get("inline_data")
-            if not inline or "data" not in inline:
+            if not inline or "data" not inline:
                 continue
             b64 = inline["data"]
             mime = inline.get("mimeType") or inline.get("mime_type") or "image/jpeg"
@@ -258,6 +263,221 @@ async def generate_image(
 
     results.insert(0, TextContent(type="text", text="\n".join(lines)))
     return results
+
+
+# ---------- OAuth 2.1 mini-provider ----------
+# Enough to satisfy the Claude Desktop/Web custom connector flow.
+# The `access_token` returned by /token IS the Gemini API key, which the user
+# pastes into the HTML form served at GET /authorize. The server never stores
+# the key beyond the life of the short-lived authorization code.
+
+_ISSUER = PUBLIC_BASE_URL
+_AUTH_CODE_TTL_SECONDS = 300
+
+
+@dataclass
+class _AuthCode:
+    gemini_key: str
+    code_challenge: str
+    code_challenge_method: str
+    redirect_uri: str
+    client_id: str
+    expires_at: float
+
+
+_auth_codes: dict[str, _AuthCode] = {}
+_registered_clients: dict[str, dict] = {}
+
+
+def _cleanup_auth_codes() -> None:
+    now = time.time()
+    for code in list(_auth_codes.keys()):
+        if _auth_codes[code].expires_at < now:
+            _auth_codes.pop(code, None)
+
+
+async def oauth_authorization_server_metadata(request: Request) -> JSONResponse:
+    return JSONResponse(
+        {
+            "issuer": _ISSUER,
+            "authorization_endpoint": f"{_ISSUER}/authorize",
+            "token_endpoint": f"{_ISSUER}/token",
+            "registration_endpoint": f"{_ISSUER}/register",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["none"],
+            "scopes_supported": ["mcp"],
+        }
+    )
+
+
+async def oauth_protected_resource_metadata(request: Request) -> JSONResponse:
+    return JSONResponse(
+        {
+            "resource": f"{_ISSUER}/mcp",
+            "authorization_servers": [_ISSUER],
+            "bearer_methods_supported": ["header"],
+            "scopes_supported": ["mcp"],
+        }
+    )
+
+
+async def oauth_register(request: Request) -> JSONResponse:
+    """Dynamic Client Registration (RFC 7591). Accept any public client."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    client_id = _secrets.token_urlsafe(16)
+    _registered_clients[client_id] = body if isinstance(body, dict) else {}
+    return JSONResponse(
+        {
+            "client_id": client_id,
+            "client_id_issued_at": int(time.time()),
+            "redirect_uris": body.get("redirect_uris", []) if isinstance(body, dict) else [],
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "client_name": body.get("client_name") if isinstance(body, dict) else None,
+            "scope": "mcp",
+        },
+        status_code=201,
+    )
+
+
+_AUTHORIZE_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Authorize Nano Banana MCP</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{{font-family:-apple-system,Segoe UI,system-ui,sans-serif;max-width:520px;margin:4em auto;padding:0 1.2em;color:#111;line-height:1.45}}
+  h1{{font-size:1.3em;margin-bottom:.2em}}
+  p{{color:#333}}
+  label{{display:block;margin:1.2em 0 .3em;font-weight:600}}
+  input[type=password],input[type=text]{{width:100%;padding:.7em;border:1px solid #bbb;border-radius:8px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:1em;box-sizing:border-box}}
+  button{{margin-top:1.2em;padding:.75em 1.3em;background:#111;color:#fff;border:0;border-radius:8px;cursor:pointer;font-size:1em}}
+  button:hover{{background:#000}}
+  small{{color:#666}}
+  code{{background:#f3f3f3;padding:.1em .35em;border-radius:4px;font-size:.92em}}
+</style>
+</head>
+<body>
+<h1>Authorize Nano Banana MCP</h1>
+<p>Paste your <strong>Google Gemini API key</strong> below to authorize this MCP connector. The key is used directly as the bearer for Gemini image calls. The server does not store it beyond the life of the short authorization code exchanged next.</p>
+<form method="POST" action="/authorize">
+{hidden}
+  <label for="gemini_key">Gemini API key</label>
+  <input id="gemini_key" type="password" name="gemini_key" required placeholder="AIza...">
+  <button type="submit">Authorize</button>
+</form>
+<p><small>Get a key at <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">aistudio.google.com/app/apikey</a>. Authorizing for client <code>{client_id}</code>.</small></p>
+</body>
+</html>
+"""
+
+
+async def oauth_authorize_get(request: Request) -> Response:
+    q = dict(request.query_params)
+    required = ["client_id", "redirect_uri", "response_type", "code_challenge", "code_challenge_method"]
+    missing = [k for k in required if k not in q]
+    if missing:
+        return JSONResponse({"error": "invalid_request", "missing": missing}, status_code=400)
+    if q.get("response_type") != "code":
+        return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
+    if q.get("code_challenge_method") != "S256":
+        return JSONResponse({"error": "invalid_request", "detail": "only S256 is supported"}, status_code=400)
+
+    hidden_fields = "".join(
+        f'  <input type="hidden" name="{_html.escape(k)}" value="{_html.escape(v)}">\n'
+        for k, v in q.items()
+    )
+    page = _AUTHORIZE_PAGE.format(hidden=hidden_fields, client_id=_html.escape(q.get("client_id", "")))
+    return Response(page, media_type="text/html; charset=utf-8")
+
+
+async def oauth_authorize_post(request: Request) -> Response:
+    form = await request.form()
+    gemini_key = (form.get("gemini_key") or "").strip()
+    if not gemini_key:
+        return JSONResponse({"error": "invalid_request", "detail": "missing gemini_key"}, status_code=400)
+    client_id = (form.get("client_id") or "").strip()
+    redirect_uri = (form.get("redirect_uri") or "").strip()
+    code_challenge = (form.get("code_challenge") or "").strip()
+    code_challenge_method = (form.get("code_challenge_method") or "S256").strip()
+    state = form.get("state") or ""
+    if not redirect_uri or not code_challenge:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+    code = _secrets.token_urlsafe(32)
+    _auth_codes[code] = _AuthCode(
+        gemini_key=gemini_key,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+        redirect_uri=redirect_uri,
+        client_id=client_id,
+        expires_at=time.time() + _AUTH_CODE_TTL_SECONDS,
+    )
+    _cleanup_auth_codes()
+
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}code={urllib.parse.quote(code)}"
+    if state:
+        location += f"&state={urllib.parse.quote(state)}"
+    return Response(status_code=302, headers={"Location": location})
+
+
+async def oauth_token(request: Request) -> JSONResponse:
+    ct = (request.headers.get("content-type") or "").lower()
+    form: dict = {}
+    if "application/x-www-form-urlencoded" in ct or "multipart/form-data" in ct:
+        f = await request.form()
+        form = {k: v for k, v in f.items()}
+    else:
+        try:
+            form = await request.json()
+        except Exception:
+            try:
+                f = await request.form()
+                form = {k: v for k, v in f.items()}
+            except Exception:
+                form = {}
+
+    grant_type = form.get("grant_type")
+    if grant_type != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+    code = form.get("code")
+    code_verifier = (form.get("code_verifier") or "").strip()
+    redirect_uri = (form.get("redirect_uri") or "").strip()
+    if not code or code not in _auth_codes:
+        return JSONResponse({"error": "invalid_grant", "detail": "unknown code"}, status_code=400)
+
+    entry = _auth_codes.pop(code)
+    if entry.expires_at < time.time():
+        return JSONResponse({"error": "invalid_grant", "detail": "expired"}, status_code=400)
+    if redirect_uri and redirect_uri != entry.redirect_uri:
+        return JSONResponse({"error": "invalid_grant", "detail": "redirect_uri mismatch"}, status_code=400)
+
+    # PKCE verification (S256).
+    if not code_verifier:
+        return JSONResponse({"error": "invalid_grant", "detail": "missing code_verifier"}, status_code=400)
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    if computed != entry.code_challenge:
+        return JSONResponse({"error": "invalid_grant", "detail": "pkce mismatch"}, status_code=400)
+
+    # Access token IS the Gemini key. No persistence.
+    return JSONResponse(
+        {
+            "access_token": entry.gemini_key,
+            "token_type": "Bearer",
+            "expires_in": 60 * 60 * 24 * 365,
+            "scope": "mcp",
+        }
+    )
 
 
 # ---------- Starlette glue (middleware + static images + health) ----------
@@ -311,6 +531,13 @@ app = Starlette(
     routes=[
         Route("/health", health),
         Route("/images/{fname}", image_handler),
+        # OAuth 2.1 discovery + endpoints (used by Claude Desktop/Web custom connector).
+        Route("/.well-known/oauth-authorization-server", oauth_authorization_server_metadata),
+        Route("/.well-known/oauth-protected-resource", oauth_protected_resource_metadata),
+        Route("/register", oauth_register, methods=["POST"]),
+        Route("/authorize", oauth_authorize_get, methods=["GET"]),
+        Route("/authorize", oauth_authorize_post, methods=["POST"]),
+        Route("/token", oauth_token, methods=["POST"]),
         Mount("/", app=mcp_app),
     ],
     middleware=[Middleware(BearerExtractorMiddleware)],
