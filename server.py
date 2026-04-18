@@ -234,7 +234,7 @@ async def generate_image(
     for cand in resp.get("candidates", []):
         for part in cand.get("content", {}).get("parts", []):
             inline = part.get("inlineData") or part.get("inline_data")
-            if not inline or "data" not inline:
+            if not inline or "data" not in inline:
                 continue
             b64 = inline["data"]
             mime = inline.get("mimeType") or inline.get("mime_type") or "image/jpeg"
