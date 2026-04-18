@@ -24,6 +24,7 @@ from typing import Literal
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ImageContent, TextContent
 from pydantic import Field
 from starlette.applications import Starlette
@@ -118,7 +119,24 @@ def cleanup_expired_images() -> int:
 
 # ---------- MCP server ----------
 
-mcp = FastMCP("nano-banana")
+# DNS-rebinding protection: the MCP SDK rejects Host headers that are not in its
+# allowlist. Nginx already enforces server_name, so we just need to whitelist
+# our public hostname (comma-separated list via env var, defaults include
+# mcp-nano-banana.mobiweb.pt and localhost for local testing).
+_allowed_hosts_env = os.getenv(
+    "ALLOWED_HOSTS",
+    "mcp-nano-banana.mobiweb.pt,localhost,127.0.0.1",
+)
+_allowed_hosts = [h.strip() for h in _allowed_hosts_env.split(",") if h.strip()]
+
+mcp = FastMCP(
+    "nano-banana",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_allowed_hosts,
+        allowed_origins=["*"],
+    ),
+)
 
 
 @mcp.tool(
