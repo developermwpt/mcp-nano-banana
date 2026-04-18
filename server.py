@@ -304,9 +304,9 @@ async def oauth_authorization_server_metadata(request: Request) -> JSONResponse:
             "token_endpoint": f"{_ISSUER}/token",
             "registration_endpoint": f"{_ISSUER}/register",
             "response_types_supported": ["code"],
-            "grant_types_supported": ["authorization_code"],
+            "grant_types_supported": ["authorization_code", "client_credentials"],
             "code_challenge_methods_supported": ["S256"],
-            "token_endpoint_auth_methods_supported": ["none"],
+            "token_endpoint_auth_methods_supported": ["none", "client_secret_basic", "client_secret_post"],
             "scopes_supported": ["mcp"],
         }
     )
@@ -446,9 +446,39 @@ async def oauth_token(request: Request) -> JSONResponse:
                 form = {}
 
     grant_type = form.get("grant_type")
-    if grant_type != "authorization_code":
+    if grant_type not in ("authorization_code", "client_credentials"):
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
+    # --- OAuth 2.0 Client Credentials Grant ---
+    # The client is expected to submit client_id + client_secret (either as form
+    # fields or HTTP Basic auth). We treat the client_secret as the Gemini API key.
+    if grant_type == "client_credentials":
+        client_secret = (form.get("client_secret") or "").strip()
+        if not client_secret:
+            auth_hdr = request.headers.get("authorization") or ""
+            if auth_hdr.lower().startswith("basic "):
+                import base64 as _b64
+                try:
+                    decoded = _b64.b64decode(auth_hdr[6:].strip()).decode("utf-8", "ignore")
+                    if ":" in decoded:
+                        client_secret = decoded.split(":", 1)[1].strip()
+                except Exception:
+                    client_secret = ""
+        if not client_secret:
+            return JSONResponse(
+                {"error": "invalid_client", "detail": "missing client_secret (= Gemini API key)"},
+                status_code=400,
+            )
+        return JSONResponse(
+            {
+                "access_token": client_secret,
+                "token_type": "Bearer",
+                "expires_in": 60 * 60 * 24 * 365,
+                "scope": "mcp",
+            }
+        )
+
+    # --- Authorization Code Grant (PKCE) below ---
     code = form.get("code")
     code_verifier = (form.get("code_verifier") or "").strip()
     redirect_uri = (form.get("redirect_uri") or "").strip()
