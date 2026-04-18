@@ -1,0 +1,17 @@
+services:
+  mcp-nano-banana:
+    build: .
+    image: mcp-nano-banana:latest
+    container_name: mcp-nano-banana
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3002:3000"
+    environment:
+      PUBLIC_BASE_URL: "https://mcp-nano-banana.mobiweb.pt"
+      IMAGE_TTL_HOURS: "24"
+      LOG_LEVEL: "INFO"
+    volumes:
+      - mcp-nano-banana-images:/app/images
+
+volumes:
+  mcp-nano-banana-images:
