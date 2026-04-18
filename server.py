@@ -296,6 +296,8 @@ app = Starlette(
         Mount("/", app=mcp_app),
     ],
     middleware=[Middleware(BearerExtractorMiddleware)],
+    # Propagate FastMCP lifespan so the session manager's task group is initialized.
+    lifespan=mcp_app.router.lifespan_context,
 )
 
 
