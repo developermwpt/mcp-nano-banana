@@ -494,6 +494,16 @@ class BearerExtractorMiddleware(BaseHTTPMiddleware):
             gk = request.headers.get("x-gemini-api-key")
             if gk:
                 token = gk.strip() or None
+        # Debug logging for troubleshooting auth flow issues.
+        if request.url.path.startswith("/mcp"):
+            hdr_summary = {
+                "path": request.url.path,
+                "method": request.method,
+                "has_auth": bool(request.headers.get("authorization")),
+                "has_xkey": bool(request.headers.get("x-gemini-api-key")),
+                "header_names": sorted([h.lower() for h in request.headers.keys()]),
+            }
+            logger.info("MCP_AUTH_DEBUG %s", hdr_summary)
         # Allow non-MCP routes (health, images) to pass through without a key.
         if token:
             _api_key_var.set(token)
