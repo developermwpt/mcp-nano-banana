@@ -503,7 +503,7 @@ class BearerExtractorMiddleware(BaseHTTPMiddleware):
                 "has_xkey": bool(request.headers.get("x-gemini-api-key")),
                 "header_names": sorted([h.lower() for h in request.headers.keys()]),
             }
-            logger.info("MCP_AUTH_DEBUG %s", hdr_summary)
+            LOG.info("MCP_AUTH_DEBUG %s", hdr_summary)
         # Allow non-MCP routes (health, images) to pass through without a key.
         if token:
             _api_key_var.set(token)
